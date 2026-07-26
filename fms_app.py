@@ -431,8 +431,10 @@ def datos_ejemplo():
 def mostrar_header():
     col1, col2 = st.columns([1, 6])
     with col1:
-        try: st.image("utp_logo.png", width=105)
-        except: st.markdown("**UTP**")
+        try:
+            st.image("utp_logo.png", width=105)
+        except:
+            st.markdown("**UTP**")
     with col2:
         st.markdown("""
         <div class="banner-utp">
@@ -453,8 +455,10 @@ def mostrar_header():
 
 def sidebar_nav():
     with st.sidebar:
-        try: st.image("utp_logo.png", width=130)
-        except: pass
+        try:
+            st.image("utp_logo.png", width=130)
+        except:
+            pass
         st.markdown("---")
         st.markdown("### 🏭 Navegación")
         modulo = st.radio("", [
@@ -663,7 +667,7 @@ def modulo_configurar():
     with c3: n_herr = st.number_input("N° de herramientas", 2, 30, 8)
     with c4: cap = st.number_input("Capacidad portaherramientas (slots)", 2, 50, 6)
 
-    cfg = st.session_state.get("cfg", {})
+    cfg = st.session_state.get("cfg") or {}
 
     st.markdown("---")
     st.markdown("### 2. Nombres")
