@@ -1272,6 +1272,7 @@ pese a ser el mismo tipo de parte. Por eso en este programa los tiempos viven a 
 **pedido**, no de tipo de parte.
         """)
 
+    seccion_analisis_grafico(lotes, bitacora, tipos)
 
 # ══════════════════════════════════════════════════════════════
 #  MÓDULO 5 — REPORTES
@@ -1417,7 +1418,672 @@ def modulo_referencias():
     [Software]. Desarrollado con Python y Streamlit. Producción III — Ingeniería Industrial.
     </div>
     """, unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════
+#  MÓDULO ADICIONAL — ANÁLISIS GRÁFICO INTEGRAL
+#  Bloque 100 % aditivo: no modifica ninguna función existente.
+#  Reutiliza EPS, PALETA, GRIS_BORDE, num(), tabla2/3/4 y los objetos
+#  MachineType / Lot que ya produce el algoritmo.
+#
+#  INTEGRACIÓN: pegar este bloque justo ANTES de la sección
+#  "APP PRINCIPAL" y agregar UNA sola línea al final de
+#  modulo_resultados():   seccion_analisis_grafico(lotes, bitacora, tipos)
+# ══════════════════════════════════════════════════════════════
 
+AG_FONDO = "#f8fafc"
+AG_LIBRE = "#eef2f7"
+AG_ROJO = "#dc2626"
+AG_AZUL = "#1e3a5f"
+
+
+# ──────────────────────────────────────────────────────────────
+#  1. DATOS DERIVADOS (sin recalcular la heurística)
+# ──────────────────────────────────────────────────────────────
+
+def ag_colores(bitacora):
+    """Un color estable por pedido (oid), con la paleta que ya usa la app."""
+    oids = []
+    for r in bitacora:
+        if r["oid"] not in oids:
+            oids.append(r["oid"])
+    return {oid: PALETA[i % len(PALETA)] for i, oid in enumerate(oids)}
+
+
+def ag_etiqueta(r):
+    return f"{r['parte']} ({r['asignadas']}/{r['tam_original']})"
+
+
+def ag_limitante(lote, tipos):
+    """Recurso que más se satura en el lote: el equivalente honesto del
+    'cuello de botella' en esta heurística. Devuelve (tipo, recurso, %)."""
+    mejor_j, mejor_rec, mejor_v = None, "", -1.0
+    for j, mt in tipos.items():
+        ut = lote.used_time[j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0.0
+        uh = len(lote.tools[j]) / mt.cap_herr * 100 if mt.cap_herr else 0.0
+        for v, rec in ((ut, "tiempo"), (uh, "portaherramientas")):
+            if v > mejor_v:
+                mejor_j, mejor_rec, mejor_v = j, rec, v
+    return mejor_j, mejor_rec, mejor_v
+
+
+def ag_tablas(lotes, bitacora, tipos):
+    """DataFrames que alimentan los gráficos y las descargas."""
+    # --- Lotes ---
+    f_lotes = []
+    for l in lotes:
+        j_lim, rec_lim, v_lim = ag_limitante(l, tipos)
+        reg = [r for r in bitacora if r["lote"] == l.indice]
+        fila = {
+            "Lote": l.indice,
+            "Pedidos asignados": len(reg),
+            "Unidades fabricadas": sum(r["asignadas"] for r in reg),
+            "Partes": ", ".join(dict.fromkeys(r["parte"] for r in reg)),
+            "Fraccionamientos": sum(1 for r in reg if r["fraccionado"]),
+        }
+        for j, mt in tipos.items():
+            fila[f"Horas usadas {j}"] = round(l.used_time[j], 4)
+            fila[f"Capacidad {j} (h)"] = mt.cap_tiempo
+            fila[f"% utilización {j}"] = round(
+                l.used_time[j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0, 2)
+            fila[f"Herramientas {j}"] = ", ".join(l.tools[j])
+            fila[f"Portaherr. usados {j}"] = f"{len(l.tools[j])}/{mt.cap_herr}"
+        fila["Recurso limitante"] = f"{rec_lim} en {j_lim} ({round(v_lim, 2)} %)"
+        f_lotes.append(fila)
+
+    # --- Máquinas ---
+    f_maq = []
+    for j, mt in tipos.items():
+        usado = sum(l.used_time[j] for l in lotes)
+        capac = mt.cap_tiempo * len(lotes)
+        herr = sorted({h for l in lotes for h in l.tools[j]})
+        f_maq.append({
+            "Tipo de máquina": j,
+            "N° de máquinas (mj)": mt.n_machines,
+            "Horas del turno (Pj)": mt.hours_per_machine,
+            "Portaherr. por máquina (Kj)": mt.holders_per_machine,
+            "Capacidad por lote (h)": mt.cap_tiempo,
+            "Espacios de herramienta por lote": mt.cap_herr,
+            "Horas usadas en total": round(usado, 4),
+            "Capacidad total (todos los lotes)": round(capac, 4),
+            "% utilización global": round(usado / capac * 100 if capac else 0, 2),
+            "Herramientas distintas usadas": ", ".join(herr),
+        })
+
+    # --- Asignaciones / Gantt ---
+    f_gantt, cursores = [], {}
+    for r in bitacora:
+        for j, mt in tipos.items():
+            dur = r["consumo"].get(j, 0.0)
+            if dur <= EPS:
+                continue
+            clave = (r["lote"], j)
+            ini = cursores.get(clave, 0.0)
+            f_gantt.append({
+                "Lote": r["lote"], "Iteración": r["iteracion"], "Tipo de máquina": j,
+                "Parte": r["parte"], "Pedido (oid)": r["oid"],
+                "Unidades": r["asignadas"], "Tamaño original": r["tam_original"],
+                "Inicio (h)": round(ini, 4), "Duración (h)": round(dur, 4),
+                "Fin (h)": round(ini + dur, 4),
+                "Capacidad del tipo (h)": mt.cap_tiempo,
+            })
+            cursores[clave] = ini + dur
+
+    # --- Iteraciones ---
+    f_iter = []
+    for r in bitacora:
+        fila = {
+            "Iteración": r["iteracion"], "Lote": r["lote"], "Parte": r["parte"],
+            "Unidades asignadas": r["asignadas"], "Tamaño original": r["tam_original"],
+            "¿Fraccionado?": "Sí" if r["fraccionado"] else "No",
+            "Pendiente después": r["resto"],
+            "Restricción que mandó": r["detalle"].get("restriccion", ""),
+        }
+        for j, mt in tipos.items():
+            fila[f"Horas consumidas {j}"] = round(r["consumo"].get(j, 0.0), 4)
+            fila[f"Tiempo acum. {j}"] = round(r["t_acum"][j], 4)
+            fila[f"% acum. {j}"] = round(
+                r["t_acum"][j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0, 2)
+            fila[f"Portaherr. ocupados {j}"] = len(r["herr_acum"][j])
+            fila[f"Herramientas acum. {j}"] = ", ".join(r["herr_acum"][j])
+        f_iter.append(fila)
+
+    # --- Rechazos (barrido antes de cerrar cada lote) ---
+    f_rech = []
+    for l in lotes:
+        for m in l.motivo_cierre:
+            d = m["detalle"]
+            if d.get("bloqueo_herr"):
+                b = d["bloqueo_herr"]
+                causa = (f"Portaherramientas en {b['tipo']}: {b['cargadas']}/{b['capacidad']} "
+                         f"ocupados y pedía {len(b['nuevas'])} nueva(s)")
+            else:
+                aprt = [f"{j} (quedan {round(i['libre'], 4)} h, una unidad pide {i['unitario']} h)"
+                        for j, i in d.get("tiempo", {}).items() if i["caben"] == 0]
+                causa = "Tiempo: no cabe ni una unidad en " + ", ".join(aprt) if aprt else "Sin espacio"
+            f_rech.append({"Lote": l.indice, "Parte rechazada": m["parte"],
+                           "Unidades pendientes": m["pendientes"], "Causa": causa})
+
+    return (pd.DataFrame(f_lotes), pd.DataFrame(f_maq), pd.DataFrame(f_gantt),
+            pd.DataFrame(f_iter), pd.DataFrame(f_rech))
+
+
+def ag_resumen(lotes, bitacora, tipos):
+    """Cifras del encabezado del dashboard."""
+    utils = []
+    for l in lotes:
+        for j, mt in tipos.items():
+            utils.append(l.used_time[j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0)
+    peor_j, peor_rec, peor_v, peor_lote = None, "", -1.0, None
+    for l in lotes:
+        j, rec, v = ag_limitante(l, tipos)
+        if v > peor_v:
+            peor_j, peor_rec, peor_v, peor_lote = j, rec, v, l.indice
+    return {
+        "lotes": len(lotes),
+        "tipos": len(tipos),
+        "maquinas": sum(mt.n_machines for mt in tipos.values()),
+        "iteraciones": len(bitacora),
+        "fraccionamientos": sum(1 for r in bitacora if r["fraccionado"]),
+        "unidades": sum(r["asignadas"] for r in bitacora),
+        "util_media": sum(utils) / len(utils) if utils else 0.0,
+        "limitante": (peor_j, peor_rec, peor_v, peor_lote),
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+#  2. GRÁFICOS
+# ──────────────────────────────────────────────────────────────
+
+def ag_estilo(ax, titulo="", xlab="", ylab=""):
+    ax.set_facecolor(AG_FONDO)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(GRIS_BORDE)
+    ax.spines["bottom"].set_color(GRIS_BORDE)
+    ax.tick_params(colors="#64748b", labelsize=9)
+    if titulo:
+        ax.set_title(titulo, fontweight="bold", color=AG_AZUL, fontsize=12, pad=12)
+    if xlab:
+        ax.set_xlabel(xlab, color=AG_AZUL, fontsize=10)
+    if ylab:
+        ax.set_ylabel(ylab, color=AG_AZUL, fontsize=10)
+
+
+def ag_g1_composicion(lotes, bitacora, colores):
+    """Gráfico 1 — Qué pedidos y cuántas unidades componen cada lote."""
+    fig, ax = plt.subplots(figsize=(11, max(2.4, 0.72 * len(lotes) + 1.7)), facecolor="white")
+    total_max = max((sum(r["asignadas"] for r in bitacora if r["lote"] == l.indice)
+                     for l in lotes), default=1) or 1
+    for l in lotes:
+        base = 0
+        for r in [x for x in bitacora if x["lote"] == l.indice]:
+            ax.barh(l.indice, r["asignadas"], left=base, height=0.62,
+                    color=colores[r["oid"]], edgecolor="white", linewidth=1.6, zorder=3)
+            if r["asignadas"] / total_max > 0.07:
+                ax.text(base + r["asignadas"] / 2, l.indice, ag_etiqueta(r),
+                        ha="center", va="center", color="white", fontsize=8.5,
+                        fontweight="bold", zorder=4)
+            base += r["asignadas"]
+        ax.text(base + total_max * 0.012, l.indice, f"{base} und.",
+                va="center", fontsize=9, fontfamily="monospace", color=AG_AZUL, zorder=4)
+    ax.set_yticks([l.indice for l in lotes])
+    ax.set_yticklabels([f"Lote {l.indice}" for l in lotes], fontsize=10, color=AG_AZUL)
+    ax.invert_yaxis()
+    ax.set_xlim(0, total_max * 1.16)
+    ax.grid(True, axis="x", color="#e2e8f0", linestyle="--", alpha=0.9, zorder=1)
+    ag_estilo(ax, "Gráfico 1 — Composición de cada lote (unidades por pedido)",
+              "Unidades fabricadas")
+    fig.tight_layout()
+    return fig
+
+
+def ag_g2_gantt(lotes, bitacora, tipos, colores):
+    """Gráfico 2 — Diagrama de Gantt: tiempo en el eje X, lote y máquina en el eje Y."""
+    filas = [(l.indice, j) for l in lotes for j in tipos]
+    cap_max = max(mt.cap_tiempo for mt in tipos.values()) or 1
+    fig, ax = plt.subplots(figsize=(11, max(2.6, 0.52 * len(filas) + 1.9)), facecolor="white")
+
+    cursores = {}
+    for idx, (li, j) in enumerate(filas):
+        mt = tipos[j]
+        y = len(filas) - 1 - idx
+        ax.broken_barh([(0, mt.cap_tiempo)], (y - 0.33, 0.66), facecolors=AG_LIBRE,
+                       edgecolor=GRIS_BORDE, linewidth=0.9, zorder=2)
+        for r in [x for x in bitacora if x["lote"] == li]:
+            w = r["consumo"].get(j, 0.0)
+            if w <= EPS:
+                continue
+            ini = cursores.get((li, j), 0.0)
+            ax.broken_barh([(ini, w)], (y - 0.33, 0.66), facecolors=colores[r["oid"]],
+                           edgecolor="white", linewidth=1.3, zorder=3)
+            if w / cap_max > 0.055:
+                ax.text(ini + w / 2, y, r["parte"], ha="center", va="center",
+                        color="white", fontsize=8.5, fontweight="bold", zorder=4)
+            cursores[(li, j)] = ini + w
+        usado = cursores.get((li, j), 0.0)
+        ax.text(cap_max * 1.015, y, f"{num(usado)} / {num(mt.cap_tiempo)} h",
+                va="center", fontsize=8.5, fontfamily="monospace", color=AG_AZUL)
+        if abs(mt.cap_tiempo - cap_max) > EPS:
+            ax.plot([mt.cap_tiempo, mt.cap_tiempo], [y - 0.4, y + 0.4],
+                    color=GRIS_BORDE, linewidth=1.4, zorder=4)
+
+    ax.set_yticks(list(range(len(filas))))
+    ax.set_yticklabels([f"Lote {li} · Máq. {j}" for li, j in reversed(filas)],
+                       fontsize=9.5, color=AG_AZUL)
+    ax.set_xlim(0, cap_max * 1.16)
+    ax.set_ylim(-0.7, len(filas) - 0.3)
+    ax.grid(True, axis="x", color="#e2e8f0", linestyle="--", alpha=0.9, zorder=1)
+    ag_estilo(ax, "Gráfico 2 — Gantt: ocupación de cada tipo de máquina en cada lote",
+              "Horas del periodo (bolsa de tiempo del tipo de máquina)")
+    fig.tight_layout()
+    return fig
+
+
+def ag_g3_cargas(lotes, tipos):
+    """Gráfico 3 — Cargas comparadas y recurso limitante de cada lote."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, max(3.0, 0.42 * len(lotes) * len(tipos) + 2.4)),
+                             facecolor="white")
+    datos = [
+        ("Tiempo de máquina",
+         lambda l, j, mt: l.used_time[j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0),
+        ("Portaherramientas",
+         lambda l, j, mt: len(l.tools[j]) / mt.cap_herr * 100 if mt.cap_herr else 0),
+    ]
+    for ax, (titulo, f) in zip(axes, datos):
+        ancho = 0.8 / max(len(tipos), 1)
+        for k, (j, mt) in enumerate(tipos.items()):
+            xs = [i + k * ancho for i in range(len(lotes))]
+            ys = [f(l, j, mt) for l in lotes]
+            limites = [ag_limitante(l, tipos) for l in lotes]
+            bordes = [AG_ROJO if (lm[0] == j and
+                                  lm[1] == ("tiempo" if "Tiempo" in titulo else "portaherramientas"))
+                      else "white" for lm in limites]
+            grosor = [2.4 if b == AG_ROJO else 1.4 for b in bordes]
+            barras = ax.bar(xs, ys, width=ancho, label=f"Máquina {j}",
+                            color=PALETA[k % len(PALETA)], zorder=3)
+            for b, col, g in zip(barras, bordes, grosor):
+                b.set_edgecolor(col)
+                b.set_linewidth(g)
+            for b, v in zip(barras, ys):
+                ax.text(b.get_x() + b.get_width() / 2, v + 2, f"{v:.1f}%".replace(".", ","),
+                        ha="center", va="bottom", fontsize=8, fontfamily="monospace",
+                        color="#374151")
+        ax.set_xticks([i + ancho * (len(tipos) - 1) / 2 for i in range(len(lotes))])
+        ax.set_xticklabels([f"Lote {l.indice}" for l in lotes], fontsize=9.5)
+        ax.set_ylim(0, 118)
+        ax.axhline(100, color=GRIS_BORDE, linestyle="--", linewidth=1.2, zorder=2)
+        ax.grid(True, axis="y", color="#e2e8f0", linestyle="--", alpha=0.9, zorder=1)
+        ag_estilo(ax, titulo, "", "% de ocupación")
+        ax.legend(fontsize=8.5, framealpha=0.95, facecolor="white", edgecolor="#e2e8f0")
+    fig.suptitle("Gráfico 3 — Carga por lote  ·  borde rojo = recurso limitante del lote",
+                 fontweight="bold", color=AG_AZUL, fontsize=12, y=1.0)
+    fig.tight_layout()
+    return fig
+
+
+def ag_g4_evolucion(lotes, bitacora, tipos):
+    """Gráfico 4 — Evolución del consumo de tiempo iteración por iteración."""
+    fig, ax = plt.subplots(figsize=(11, 4.0), facecolor="white")
+    its = [r["iteracion"] for r in bitacora]
+
+    for l in lotes:
+        reg = [r["iteracion"] for r in bitacora if r["lote"] == l.indice]
+        if not reg:
+            continue
+        ax.axvspan(min(reg) - 0.5, max(reg) + 0.5,
+                   color="#e0e7ff" if l.indice % 2 else "#f1f5f9", alpha=0.55, zorder=1)
+        ax.text((min(reg) + max(reg)) / 2, 108, f"Lote {l.indice}", ha="center",
+                fontsize=9.5, fontweight="bold", color=AG_AZUL, zorder=5)
+
+    for k, (j, mt) in enumerate(tipos.items()):
+        xs, ys, lote_prev = [], [], None
+        for r in bitacora:
+            if lote_prev is not None and r["lote"] != lote_prev:
+                xs.append(None)   # corta la línea: el lote nuevo arranca en cero
+                ys.append(None)
+            xs.append(r["iteracion"])
+            ys.append(r["t_acum"][j] / mt.cap_tiempo * 100 if mt.cap_tiempo else 0)
+            lote_prev = r["lote"]
+        ax.plot(xs, ys, marker="o", markersize=6, linewidth=2.2,
+                color=PALETA[k % len(PALETA)], label=f"Máquina {j}", zorder=4)
+
+    for r in bitacora:
+        if r["fraccionado"]:
+            ax.annotate("fracción", (r["iteracion"], 4), fontsize=8, color="#92400e",
+                        ha="center", zorder=5)
+
+    ax.axhline(100, color=AG_ROJO, linestyle="--", linewidth=1.3, zorder=3)
+    ax.text(its[-1] if its else 0, 101.5, "capacidad del lote", ha="right",
+            fontsize=8.5, color=AG_ROJO)
+    ax.set_xticks(its)
+    ax.set_ylim(0, 118)
+    ax.grid(True, axis="y", color="#e2e8f0", linestyle="--", alpha=0.9, zorder=2)
+    ag_estilo(ax, "Gráfico 4 — Evolución del tiempo acumulado por iteración",
+              "Iteración de la heurística", "% de la capacidad del lote")
+    ax.legend(fontsize=9, framealpha=0.95, facecolor="white", edgecolor="#e2e8f0", loc="lower right")
+    fig.tight_layout()
+    return fig
+
+
+def ag_g5_portaherramientas(lotes, bitacora, tipos):
+    """Gráfico 5 — Ocupación de los portaherramientas iteración por iteración."""
+    fig, ax = plt.subplots(figsize=(11, 3.8), facecolor="white")
+    its = [r["iteracion"] for r in bitacora]
+
+    for l in lotes:
+        reg = [r["iteracion"] for r in bitacora if r["lote"] == l.indice]
+        if not reg:
+            continue
+        ax.axvspan(min(reg) - 0.5, max(reg) + 0.5,
+                   color="#e0e7ff" if l.indice % 2 else "#f1f5f9", alpha=0.55, zorder=1)
+
+    cap_max = max(mt.cap_herr for mt in tipos.values()) or 1
+    for k, (j, mt) in enumerate(tipos.items()):
+        xs, ys, lote_prev = [], [], None
+        for r in bitacora:
+            if lote_prev is not None and r["lote"] != lote_prev:
+                xs.append(None)   # corta la línea: alistamiento nuevo
+                ys.append(None)
+            xs.append(r["iteracion"])
+            ys.append(len(r["herr_acum"][j]))
+            lote_prev = r["lote"]
+        ax.step(xs, ys, where="post", linewidth=2.4, color=PALETA[k % len(PALETA)],
+                label=f"Máquina {j}  (máx. {mt.cap_herr})", zorder=4)
+        ax.plot(xs, ys, "o", markersize=5.5, color=PALETA[k % len(PALETA)], zorder=5)
+        ax.axhline(mt.cap_herr, color=PALETA[k % len(PALETA)], linestyle=":",
+                   linewidth=1.4, alpha=0.8, zorder=3)
+
+    ax.set_xticks(its)
+    ax.set_ylim(0, cap_max + 1.2)
+    ax.set_yticks(range(0, int(cap_max) + 2))
+    ax.grid(True, axis="y", color="#e2e8f0", linestyle="--", alpha=0.9, zorder=2)
+    ag_estilo(ax, "Gráfico 5 — Portaherramientas ocupados por iteración "
+                  "(línea punteada = capacidad)",
+              "Iteración de la heurística", "Espacios ocupados")
+    ax.legend(fontsize=9, framealpha=0.95, facecolor="white", edgecolor="#e2e8f0", loc="lower right")
+    fig.tight_layout()
+    return fig
+
+
+def ag_g6_mapa_herramientas(lotes, tipos):
+    """Gráfico 6 — Qué herramienta está cargada en qué lote (alistamiento de cada lote)."""
+    herr = []
+    for j in tipos:
+        for l in lotes:
+            for h in l.tools[j]:
+                if (j, h) not in herr:
+                    herr.append((j, h))
+    if not herr:
+        fig, ax = plt.subplots(figsize=(11, 2.2), facecolor="white")
+        ax.text(0.5, 0.5, "No se cargó ninguna herramienta.", ha="center", va="center",
+                fontsize=11, color="#64748b")
+        ax.axis("off")
+        return fig
+
+    fig, ax = plt.subplots(figsize=(11, max(2.4, 0.42 * len(herr) + 1.8)), facecolor="white")
+    codigos = list(tipos.keys())
+    for fi, (j, h) in enumerate(herr):
+        y = len(herr) - 1 - fi
+        color = PALETA[codigos.index(j) % len(PALETA)]
+        for l in lotes:
+            x = l.indice - 1
+            cargada = h in l.tools[j]
+            ax.broken_barh([(x + 0.08, 0.84)], (y - 0.34, 0.68),
+                           facecolors=color if cargada else "white",
+                           edgecolor=color if cargada else GRIS_BORDE,
+                           linewidth=1.3, alpha=1.0 if cargada else 1.0, zorder=3)
+            if cargada:
+                ax.text(x + 0.5, y, "●", ha="center", va="center", color="white",
+                        fontsize=11, zorder=4)
+    ax.set_yticks(list(range(len(herr))))
+    ax.set_yticklabels([f"{h}  (máq. {j})" for j, h in reversed(herr)],
+                       fontsize=9.5, color=AG_AZUL)
+    ax.set_xticks([l.indice - 0.5 for l in lotes])
+    ax.set_xticklabels([f"Lote {l.indice}" for l in lotes], fontsize=10, color=AG_AZUL)
+    ax.set_xlim(0, len(lotes))
+    ax.set_ylim(-0.7, len(herr) - 0.3)
+    ag_estilo(ax, "Gráfico 6 — Alistamiento: herramientas cargadas en cada lote")
+    fig.tight_layout()
+    return fig
+
+
+# ──────────────────────────────────────────────────────────────
+#  3. DESCARGAS
+# ──────────────────────────────────────────────────────────────
+
+def ag_excel(dfs, figs):
+    """Excel con todas las hojas de datos y una hoja con los gráficos incrustados.
+    Devuelve (bytes, motor) o (None, None) si no hay motor disponible."""
+    motor = None
+    for cand in ("xlsxwriter", "openpyxl"):
+        try:
+            __import__(cand)
+            motor = cand
+            break
+        except ImportError:
+            continue
+    if motor is None:
+        return None, None
+
+    imgs = []
+    for titulo, fig in figs.items():
+        b = io.BytesIO()
+        fig.savefig(b, format="png", dpi=120, bbox_inches="tight", facecolor="white")
+        b.seek(0)
+        imgs.append((titulo, b))
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine=motor) as w:
+        for hoja, df in dfs.items():
+            df.to_excel(w, sheet_name=hoja[:31], index=False)
+        try:
+            if motor == "xlsxwriter":
+                ws = w.book.add_worksheet("Gráficos")
+                fila = 0
+                for titulo, b in imgs:
+                    ws.write(fila, 0, titulo)
+                    ws.insert_image(fila + 1, 0, f"{titulo}.png",
+                                    {"image_data": b, "x_scale": 0.62, "y_scale": 0.62})
+                    fila += 32
+            else:
+                from openpyxl.drawing.image import Image as XLImage
+                ws = w.book.create_sheet("Gráficos")
+                fila = 1
+                for titulo, b in imgs:
+                    ws.cell(row=fila, column=1, value=titulo)
+                    img = XLImage(b)
+                    img.width, img.height = img.width * 0.62, img.height * 0.62
+                    ws.add_image(img, f"A{fila + 1}")
+                    fila += 32
+        except Exception:
+            pass  # si falla la incrustación, el Excel de datos igual se entrega
+    buf.seek(0)
+    return buf.getvalue(), motor
+
+
+def ag_pdf(figs, resumen, dfs):
+    """Informe gráfico en PDF: portada con el resumen y una página por gráfico."""
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        j_lim, rec_lim, v_lim, lote_lim = resumen["limitante"]
+        portada, ax = plt.subplots(figsize=(11.69, 8.27), facecolor="white")
+        ax.axis("off")
+        ax.text(0.5, 0.93, "Análisis gráfico de lotes, máquinas e iteraciones",
+                ha="center", fontsize=20, fontweight="bold", color=AG_AZUL)
+        ax.text(0.5, 0.875, "FMS.lab — Heurística de Selección de Partes",
+                ha="center", fontsize=12, color="#2563eb")
+        ax.text(0.5, 0.845,
+                datetime.datetime.now().strftime("Generado el %d/%m/%Y a las %H:%M"),
+                ha="center", fontsize=9.5, color="#64748b")
+        lineas = [
+            ("Lotes formados", str(resumen["lotes"])),
+            ("Tipos de máquina", str(resumen["tipos"])),
+            ("Máquinas en el sistema", str(resumen["maquinas"])),
+            ("Iteraciones de la heurística", str(resumen["iteraciones"])),
+            ("Pedidos fraccionados", str(resumen["fraccionamientos"])),
+            ("Unidades programadas", str(resumen["unidades"])),
+            ("Utilización media de las máquinas", f"{resumen['util_media']:.2f} %"),
+            ("Recurso limitante", f"{rec_lim} en la máquina {j_lim} "
+                                  f"(Lote {lote_lim}, {v_lim:.2f} %)"),
+        ]
+        y = 0.74
+        for etq, val in lineas:
+            ax.text(0.16, y, etq, fontsize=11.5, color="#374151")
+            ax.text(0.84, y, val, fontsize=11.5, fontweight="bold", color=AG_AZUL, ha="right")
+            ax.plot([0.16, 0.84], [y - 0.018, y - 0.018], color="#e2e8f0", linewidth=0.8)
+            y -= 0.055
+        ax.text(0.5, 0.10,
+                "La heurística de selección de partes es constructiva de una sola pasada: cada\n"
+                "iteración agrega un pedido al lote abierto. El 'recurso limitante' es el que más\n"
+                "se satura y el que obliga a cerrar el lote.",
+                ha="center", fontsize=9.5, color="#64748b")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        pdf.savefig(portada, facecolor="white")
+        plt.close(portada)
+
+        for fig in figs.values():
+            pdf.savefig(fig, facecolor="white", bbox_inches="tight")
+
+        meta = pdf.infodict()
+        meta["Title"] = "FMS.lab — Análisis gráfico de lotes, máquinas e iteraciones"
+        meta["Author"] = "FMS.lab — UTP"
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ──────────────────────────────────────────────────────────────
+#  4. SECCIÓN DE LA INTERFAZ
+# ──────────────────────────────────────────────────────────────
+
+def seccion_analisis_grafico(lotes, bitacora, tipos):
+    """Nueva sección al final de la página. No altera nada de lo existente."""
+    if not lotes or not bitacora:
+        return
+
+    st.markdown('<div class="grad-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📊 Análisis gráfico de lotes, máquinas '
+                'e iteraciones</div>', unsafe_allow_html=True)
+
+    colores = ag_colores(bitacora)
+    df_lotes, df_maq, df_gantt, df_iter, df_rech = ag_tablas(lotes, bitacora, tipos)
+    res = ag_resumen(lotes, bitacora, tipos)
+    j_lim, rec_lim, v_lim, lote_lim = res["limitante"]
+
+    # ---- Resumen general ----
+    c = st.columns(5)
+    tarjetas = [
+        ("Lotes", res["lotes"], ""),
+        ("Máquinas", res["maquinas"], f"{res['tipos']} tipo(s)"),
+        ("Iteraciones", res["iteraciones"], f"{res['fraccionamientos']} fraccionamiento(s)"),
+        ("Unidades programadas", res["unidades"], ""),
+        ("Utilización media", f"{num(res['util_media'])} %", ""),
+    ]
+    for col, (etq, val, pie) in zip(c, tarjetas):
+        col.markdown(
+            f'<div class="metric-card"><div class="metric-label">{etq}</div>'
+            f'<div class="metric-value">{val}</div>'
+            + (f'<div style="font-size:0.78rem;color:#64748b;margin-top:4px;">{pie}</div>'
+               if pie else "")
+            + '</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div class="alert-warn">🎯 <b>Recurso limitante:</b> '
+        f'<b>{rec_lim}</b> de la máquina <b>{j_lim}</b>, en el <b>Lote {lote_lim}</b>, '
+        f'con {num(v_lim)} % de ocupación. Es el recurso que se satura primero y el que '
+        f'obliga a cerrar el lote — el equivalente al cuello de botella en esta heurística.'
+        f'</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="alert-info">📌 Esta heurística es <b>constructiva de una sola '
+                'pasada</b>: cada iteración agrega un pedido al lote abierto, no mejora una '
+                'solución anterior. Por eso los gráficos muestran <b>cómo se fueron consumiendo '
+                'los recursos</b> iteración a iteración, no una curva de optimización.</div>',
+                unsafe_allow_html=True)
+
+    # ---- Gráficos ----
+    figs = {}
+    figs["Gráfico 1 — Composición de los lotes"] = ag_g1_composicion(lotes, bitacora, colores)
+    figs["Gráfico 2 — Gantt de máquinas"] = ag_g2_gantt(lotes, bitacora, tipos, colores)
+    figs["Gráfico 3 — Cargas y recurso limitante"] = ag_g3_cargas(lotes, tipos)
+    figs["Gráfico 4 — Evolución por iteración"] = ag_g4_evolucion(lotes, bitacora, tipos)
+    figs["Gráfico 5 — Portaherramientas por iteración"] = ag_g5_portaherramientas(
+        lotes, bitacora, tipos)
+    figs["Gráfico 6 — Herramientas por lote"] = ag_g6_mapa_herramientas(lotes, tipos)
+
+    pies = {
+        "Gráfico 1 — Composición de los lotes":
+            "Cada barra es un lote; cada segmento, un pedido con las unidades que se le "
+            "programaron. La notación parte (asignadas/tamaño original) muestra los "
+            "fraccionamientos.",
+        "Gráfico 2 — Gantt de máquinas":
+            "Eje X: la bolsa de tiempo del tipo de máquina (mⱼ × Pⱼ). Cada bloque es un pedido y "
+            "su ancho es la duración. El área gris es la capacidad no utilizada.",
+        "Gráfico 3 — Cargas y recurso limitante":
+            "Ocupación de los dos recursos del modelo. La barra con borde rojo es el recurso que "
+            "más se satura en ese lote.",
+        "Gráfico 4 — Evolución por iteración":
+            "Cómo creció el tiempo acumulado en cada tipo de máquina. Al abrir un lote nuevo "
+            "todo vuelve a cero: es el alistamiento.",
+        "Gráfico 5 — Portaherramientas por iteración":
+            "Ocupación de los portaherramientas. Cuando la línea toca la punteada, ya no caben "
+            "herramientas nuevas y solo entran pedidos que reutilicen las cargadas.",
+        "Gráfico 6 — Herramientas por lote":
+            "Alistamiento de cada lote: qué herramienta se cargó en cada uno y en qué máquina.",
+    }
+    for titulo, fig in figs.items():
+        st.markdown(f"#### {titulo}")
+        st.pyplot(fig, use_container_width=True)
+        st.caption(pies.get(titulo, ""))
+
+    # ---- Datos de respaldo ----
+    with st.expander("📄 Datos que alimentan estos gráficos"):
+        t = st.tabs(["Lotes", "Máquinas", "Asignaciones (Gantt)", "Iteraciones", "Rechazos"])
+        for tab, df in zip(t, [df_lotes, df_maq, df_gantt, df_iter, df_rech]):
+            with tab:
+                if df.empty:
+                    st.caption("Sin registros.")
+                else:
+                    st.dataframe(df, hide_index=True, use_container_width=True)
+
+    # ---- Descargas ----
+    st.markdown("#### Descargar el análisis")
+    dfs = {"Resumen": pd.DataFrame([{
+        "Lotes": res["lotes"], "Tipos de máquina": res["tipos"],
+        "Máquinas": res["maquinas"], "Iteraciones": res["iteraciones"],
+        "Fraccionamientos": res["fraccionamientos"], "Unidades": res["unidades"],
+        "Utilización media (%)": round(res["util_media"], 2),
+        "Recurso limitante": f"{rec_lim} en {j_lim} (Lote {lote_lim}, {round(v_lim, 2)} %)",
+    }]),
+        "Lotes": df_lotes, "Maquinas": df_maq, "Asignaciones": df_gantt,
+        "Iteraciones": df_iter, "Rechazos": df_rech,
+    }
+
+    ts_ag = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    c1, c2 = st.columns(2)
+    with c1:
+        datos_xlsx, motor = ag_excel(dfs, figs)
+        if datos_xlsx:
+            st.download_button("⬇️ Descargar análisis en Excel", datos_xlsx,
+                               f"fms_analisis_grafico_{ts_ag}.xlsx",
+                               "application/vnd.openxmlformats-officedocument."
+                               "spreadsheetml.sheet",
+                               use_container_width=True, key="ag_dl_xlsx")
+        else:
+            st.markdown('<div class="alert-warn">Para el Excel agrega <code>xlsxwriter</code> '
+                        'a requirements.txt.</div>', unsafe_allow_html=True)
+    with c2:
+        try:
+            datos_pdf = ag_pdf(figs, res, dfs)
+            st.download_button("⬇️ Descargar análisis en PDF", datos_pdf,
+                               f"fms_analisis_grafico_{ts_ag}.pdf", "application/pdf",
+                               use_container_width=True, key="ag_dl_pdf")
+        except Exception as e:
+            st.markdown(f'<div class="alert-warn">No se pudo generar el PDF: {e}</div>',
+                        unsafe_allow_html=True)
+
+    for fig in figs.values():
+        plt.close(fig)
 
 # ══════════════════════════════════════════════════════════════
 #  APP PRINCIPAL
