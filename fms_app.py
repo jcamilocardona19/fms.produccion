@@ -1001,7 +1001,7 @@ def modulo_configurar():
             help="Día relativo entero: 0, 1, 2, 4… Si manejas fechas reales, conviértelas a día ordinal."),
     }
     for j in codigos:
-        colcfg[f"h/und en {j}"] = st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")
+        colcfg[f"h/und en {j}"] = st.column_config.NumberColumn(min_value=0.0, step=0.001, format="%.3f")
         colcfg[f"Herramientas {j}"] = st.column_config.TextColumn(
             help=f"Herramientas que la pieza necesita en la máquina {j}, separadas por coma.")
 
